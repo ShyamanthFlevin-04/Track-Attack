@@ -138,6 +138,7 @@ class YOLOPInference:
         self._warp_size  = None
 
         self._last_mask = None
+        self._last_da_mask   = None   # drivable-area segmentation mask (current frame)
         self._last_left_fit  = None
         self._last_right_fit = None
 
@@ -178,7 +179,8 @@ class YOLOPInference:
         self._ema_curvature = 0.0
         self._ema_radius   = float('inf')
 
-    def process_frame(self, img_raw: np.ndarray, roi_points_norm: list):
+    def process_frame(self, img_raw: np.ndarray, roi_points_norm: list,
+                      show_drivable: bool = False):
         self._frame_idx += 1
         
         now = time.time()
@@ -204,6 +206,12 @@ class YOLOPInference:
 
         img_in, ratio, pad = self._preprocess(img_raw)
         ll_mask_orig, decode_dbg = self._infer_and_decode(img_in, pad, h_orig, w_orig)
+
+        # Drivable area green carpet overlay (ADAS-style) — applied before lane lines
+        if show_drivable and self._last_da_mask is not None:
+            da_layer = img_out.copy()
+            da_layer[self._last_da_mask > 0] = (0, 200, 0)
+            cv2.addWeighted(da_layer, 0.30, img_out, 0.70, 0, img_out)
 
         self._refresh_warp_maps_fixed(w_orig, h_orig)
 
@@ -319,9 +327,29 @@ class YOLOPInference:
         for lane_data in extra_lanes_data:
             col = (255, 200, 0) if 'L' in lane_data['name'] else (0, 255, 255)
             render_sliding_sequence(lane_data, col, lane_data['name'])
-            
-        # Draw Smooth Center Line for visual reference
-        if ego_centre_poly is not None:
+
+        # --- Polynomial lane curves extrapolated to image bottom ---
+        # Subtle lane-region fill (L/R polynomials must both be present)
+        if (self._last_left_fit is not None and self._last_right_fit is not None
+                and self._Minv is not None):
+            self._draw_lane_region(img_out, self._last_left_fit,
+                                   self._last_right_fit, h_orig)
+
+        # L/R polynomial lines from y=h (bumper) to horizon — eliminates floating
+        if self._last_left_fit is not None and self._Minv is not None:
+            self._draw_poly_curve(img_out, self._last_left_fit,
+                                  h_orig, (0, 255, 0), thickness=3)
+        if self._last_right_fit is not None and self._Minv is not None:
+            self._draw_poly_curve(img_out, self._last_right_fit,
+                                  h_orig, (0, 100, 255), thickness=3)
+
+        # Center line: strict midpoint, anchored at image bottom
+        if (self._last_left_fit is not None and self._last_right_fit is not None
+                and self._Minv is not None):
+            centre_fit = (self._last_left_fit + self._last_right_fit) / 2.0
+            self._draw_poly_curve(img_out, centre_fit,
+                                  h_orig, (0, 200, 255), thickness=2)
+        elif ego_centre_poly is not None:
             cv2.polylines(img_out, [ego_centre_poly], False, (0, 200, 255), 2, cv2.LINE_AA)
 
         # ---------------------------------------------------------
@@ -386,27 +414,43 @@ class YOLOPInference:
             ll_mask_small = (ll_probs > 0.5).squeeze().cpu().numpy().astype(np.uint8)
 
             mh, mw = ll_mask_small.shape
-            dw, dh = float(pad[0]), float(pad[1])
-            top    = round(dh);         bottom = mh - round(dh)
-            left   = round(dw);         right  = mw - round(dw)
-            top    = max(0, min(top,    mh - 1))
-            bottom = max(top + 1, min(bottom, mh))
-            left   = max(0, min(left,   mw - 1))
-            right  = max(left + 1, min(right,  mw))
+            top, bottom, left, right = self._crop_bounds(pad, mh, mw)
 
             ll_cropped = ll_mask_small[top:bottom, left:right]
             if ll_cropped.size == 0:
+                self._last_da_mask = None
                 return None, dbg
 
             ll_full = cv2.resize(ll_cropped, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
+
+            # --- Drivable-area mask (YOLOPv2 seg head) ---
+            da_full = None
+            try:
+                if _seg is not None:
+                    if _seg.dim() == 4 and _seg.shape[1] >= 2:
+                        da_small = (_seg.argmax(dim=1) == 1).squeeze().cpu().numpy().astype(np.uint8)
+                    else:
+                        da_small = (torch.sigmoid(_seg) > 0.5).squeeze().cpu().numpy().astype(np.uint8)
+                    if da_small.ndim != 2:
+                        da_small = da_small.reshape(da_small.shape[-2], da_small.shape[-1])
+                    da_mh, da_mw = da_small.shape
+                    da_t, da_b, da_l, da_r = self._crop_bounds(pad, da_mh, da_mw)
+                    da_crop = da_small[da_t:da_b, da_l:da_r]
+                    if da_crop.size > 0:
+                        da_full = cv2.resize(da_crop, (w_orig, h_orig),
+                                             interpolation=cv2.INTER_NEAREST)
+            except Exception as da_err:
+                self._log(f"[LANE] DA mask decode skipped: {da_err}")
+            self._last_da_mask = da_full
             return ll_full, dbg
 
         except Exception as e:
+            self._last_da_mask = None
             return None, dbg
 
     def _refresh_warp_maps_fixed(self, w: int, h: int):
         if self._warp_size == (w, h):
-            return   
+            return
 
         self._warp_size  = (w, h)
         top_left_x    = w * (0.50 - (self._BEV_TOP_WIDTH / 2.0))
@@ -425,9 +469,65 @@ class YOLOPInference:
         self._M    = cv2.getPerspectiveTransform(src_pts, dst_pts)
         self._Minv = cv2.getPerspectiveTransform(dst_pts, src_pts)
 
+    @staticmethod
+    def _crop_bounds(pad: tuple, mask_h: int, mask_w: int) -> tuple:
+        """Return (top, bottom, left, right) crop indices that strip letterbox padding."""
+        dw, dh = float(pad[0]), float(pad[1])
+        top    = max(0, min(round(dh), mask_h - 1))
+        bottom = max(top + 1, min(mask_h - round(dh), mask_h))
+        left   = max(0, min(round(dw), mask_w - 1))
+        right  = max(left + 1, min(mask_w - round(dw), mask_w))
+        return top, bottom, left, right
+
+    # ------------------------------------------------------------------
+    # Polynomial lane-curve rendering helpers
+    # ------------------------------------------------------------------
+    def _draw_poly_curve(self, img_out: np.ndarray, fit: np.ndarray,
+                         h: int, color: tuple, thickness: int = 3) -> None:
+        """Draw a smooth polynomial curve from y=h (bumper) to the BEV horizon.
+
+        Evaluating the fit in BEV space and back-projecting via Minv ensures
+        the lane line is anchored to the physical road surface from the bottom
+        of the frame up to the vanishing point — no "floating" appearance.
+        """
+        if fit is None or self._Minv is None:
+            return
+        horizon_y = int(h * self._CUT_HEIGHT_RATIO)
+        w = img_out.shape[1]
+        ys = np.linspace(h - 1, horizon_y, 80, dtype=np.float32)
+        xs = np.polyval(fit, ys).astype(np.float32)
+        valid = (xs >= 0) & (xs < w)
+        if not np.any(valid):
+            return
+        pts_bev = np.column_stack((xs[valid], ys[valid])).reshape(1, -1, 2)
+        pts_persp = cv2.perspectiveTransform(pts_bev, self._Minv)[0].astype(np.int32)
+        cv2.polylines(img_out, [pts_persp], False, color, thickness, cv2.LINE_AA)
+
+    def _draw_lane_region(self, img_out: np.ndarray, left_fit: np.ndarray,
+                          right_fit: np.ndarray, h: int,
+                          color: tuple = (0, 200, 80),
+                          alpha: float = 0.18) -> None:
+        """Alpha-blend a filled polygon between the left and right polynomial lanes."""
+        if self._Minv is None:
+            return
+        horizon_y = int(h * self._CUT_HEIGHT_RATIO)
+        w = img_out.shape[1]
+        ys = np.linspace(h - 1, horizon_y, 50, dtype=np.float32)
+        xs_l = np.clip(np.polyval(left_fit,  ys), 0, w - 1).astype(np.float32)
+        xs_r = np.clip(np.polyval(right_fit, ys), 0, w - 1).astype(np.float32)
+        # Left side going up, right side coming back down → closed polygon in BEV
+        left_bev  = np.column_stack((xs_l, ys))
+        right_bev = np.column_stack((xs_r, ys[::-1]))
+        poly_bev  = np.vstack((left_bev, right_bev)).reshape(1, -1, 2).astype(np.float32)
+        poly_persp = cv2.perspectiveTransform(poly_bev, self._Minv)[0].astype(np.int32)
+        overlay = img_out.copy()
+        cv2.fillPoly(overlay, [poly_persp], color)
+        cv2.addWeighted(overlay, alpha, img_out, 1.0 - alpha, 0, img_out)
+
     # ------------------------------------------------------------------
     # Ego-lane candidate scoring
     # ------------------------------------------------------------------
+
     def _score_ego_candidate(self, candidate: dict, side: str, h: int, w: int) -> float:
         """
         Score a lane candidate for ego selection.  Returns 0–100.
