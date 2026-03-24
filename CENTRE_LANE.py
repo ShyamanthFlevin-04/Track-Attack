@@ -1,23 +1,38 @@
 """
-CENTRE_LANE.py  —  Centre-Line Estimation Module (Optimized)
-============================================================
+CENTRE_LANE.py  —  Centre-Line Estimation Module (v2 - EMA Smoothed Signals)
+=============================================================================
+Added in v2:
+  • EMA smoothing for curvature_k, radius_m, and heading_deg to reduce
+    frame-to-frame jitter from fitpolynomial noise.
+  • Smoothing alpha driven by CONFIG.TELEM_EMA_ALPHA (default 0.35).
 """
 
 import numpy as np
 import cv2
+try:
+    import CONFIG as _CONFIG
+except ImportError:
+    _CONFIG = None
 
 # FORCED OFF FOR SPEED Optimization: B-Spline is mathematically heavy. 
 _SCIPY_OK = False 
 
 _XM_PER_PIX  = 3.7 / 700        
-_LOG_EVERY_N = 30                
+_LOG_EVERY_N = 30
+# Threshold above which a radius value is treated as effectively infinite (straight road)
+_RADIUS_INF  = 1e6
 
 class CentreLaneEstimator:
     def __init__(self, log_fn=None, xm_per_pix: float = _XM_PER_PIX):
         self._log        = log_fn if log_fn else print
         self._xm_per_pix = xm_per_pix
         self._frame_idx  = 0
-        self._prev_ego_centre = None   
+        self._prev_ego_centre = None
+
+        # EMA state for smoothing curvature and heading signals
+        self._ema_curvature = 0.0
+        self._ema_heading   = 0.0
+        self._ema_radius    = float('inf')
 
     def estimate(self, left_fit: np.ndarray | None, right_fit: np.ndarray | None, ploty: np.ndarray, h: int, w: int, Minv: np.ndarray) -> dict:
         self._frame_idx += 1
@@ -57,6 +72,22 @@ class CentreLaneEstimator:
         result['radius_m']      = R
         result['heading_deg']   = heading_deg
         result['turn_direction'] = direction
+
+        # EMA smoothing for curvature and heading to reduce per-frame jitter
+        alpha = float(getattr(_CONFIG, 'TELEM_EMA_ALPHA', 0.35)) if _CONFIG else 0.35
+        self._ema_curvature = alpha * k + (1.0 - alpha) * self._ema_curvature
+        self._ema_heading   = alpha * heading_deg + (1.0 - alpha) * self._ema_heading
+        finite_r = R if R < _RADIUS_INF else self._ema_radius
+        if finite_r < _RADIUS_INF:
+            self._ema_radius = (
+                alpha * finite_r
+                + (1.0 - alpha) * (self._ema_radius if self._ema_radius < _RADIUS_INF else finite_r)
+            )
+        # Expose smoothed values alongside raw values
+        result['curvature_k'] = self._ema_curvature
+        result['heading_deg'] = self._ema_heading
+        if self._ema_radius < _RADIUS_INF:
+            result['radius_m'] = self._ema_radius
 
         draw_pts_bev = centre_pts_bev
         ego_pts = self._bev_to_ego(draw_pts_bev, Minv, log_this)
