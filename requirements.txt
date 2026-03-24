@@ -1,0 +1,22 @@
+# Track-Attack — LKA Perception & Control System
+# Install with:  pip install -r requirements.txt
+#
+# GPU (CUDA 11.8) build of PyTorch is the default.
+# For CPU-only inference replace the torch/torchvision lines with:
+#   torch>=2.0.0
+#   torchvision>=0.15.0
+
+# --- Deep Learning ---
+torch>=2.0.0
+torchvision>=0.15.0
+
+# --- Computer Vision & Numerics ---
+numpy>=1.24.0
+opencv-python>=4.8.0
+
+# --- GUI ---
+Pillow>=10.0.0
+customtkinter>=5.2.0
+
+# --- System Monitoring (optional — gracefully degraded if absent) ---
+psutil>=5.9.0
