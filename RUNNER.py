@@ -4,6 +4,7 @@ RUNNER.py - LKA Controller (Zero-Calib / Auto-Ego Selection)
 """
 
 import os
+import math
 import time
 import threading
 import queue
@@ -52,14 +53,24 @@ class LKA_App:
         self.root = root
         self.root.title("Autonomous LKA Perception & Control Dashboard")
         
-        self.root.geometry(f"{WIN_W}x{WIN_H}+50+50")
+        # Maximize to screen resolution — prevents the window from being
+        # clipped or spawning too small on various screen configurations.
+        self.root.update_idletasks()
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        self.root.geometry(f"{sw}x{sh}+0+0")
         self.root.minsize(1400, 900)
+        try:
+            self.root.state('zoomed')          # Windows / some WMs
+        except tk.TclError:
+            pass
         
         self.is_running = False
         self.stop_event = threading.Event()
         
         self.source_path = ctk.StringVar(value="")
         self.input_mode  = ctk.StringVar(value="camera")
+        self.show_drivable_area = ctk.BooleanVar(value=False)
         
         # Hardcoded ROI from CONFIG - No more manual dragging
         self.calib_points = list(CONFIG.DEFAULT_ROI_POINTS)
@@ -110,7 +121,13 @@ class LKA_App:
         self.btn_run.pack(fill="x", padx=20, pady=10)
         
         self.btn_stop = ctk.CTkButton(ctrl_frame, text="■ EMERGENCY STOP", height=60, font=btn_font, state="disabled", fg_color="#da3633", hover_color="#b62324", command=self.stop_system)
-        self.btn_stop.pack(fill="x", padx=20, pady=(10, 20))
+        self.btn_stop.pack(fill="x", padx=20, pady=(10, 10))
+
+        self.switch_drivable = ctk.CTkSwitch(
+            ctrl_frame, text="Toggle Drivable Area",
+            variable=self.show_drivable_area,
+            font=("Segoe UI", 14), onvalue=True, offvalue=False)
+        self.switch_drivable.pack(anchor="w", padx=25, pady=(4, 18))
 
         log_frame = ctk.CTkFrame(left, corner_radius=15, fg_color="#161b22", border_width=1, border_color="#30363d")
         log_frame.pack(fill="both", expand=True)
@@ -240,7 +257,9 @@ class LKA_App:
                 if not ret: break
 
             try:
-                img_out, telemetry, ll_mask = engine.process_frame(frame, self.calib_points)
+                img_out, telemetry, ll_mask = engine.process_frame(
+                    frame, self.calib_points,
+                    show_drivable=self.show_drivable_area.get())
                 
                 # --- VIRTUAL CENTER LINE FIX ---
                 h_orig, w_orig = frame.shape[:2]
@@ -297,6 +316,46 @@ class LKA_App:
         
         col = (0, 200, 255) if abs(cte) > 0.4 else (63, 185, 80)
         cv2.putText(img, ctrl_txt, (20, 65), font, 0.75, col, 2)
+
+        # Steering wheel HUD widget (bottom-right corner)
+        self._draw_steering_wheel(img, str_ang)
+
+    @staticmethod
+    def _draw_steering_wheel(img: np.ndarray, steer_rad: float) -> None:
+        """Draw a dynamic steering wheel widget in the bottom-right corner."""
+        h, w = img.shape[:2]
+        outer_r = 58
+        cx, cy  = w - outer_r - 20, h - outer_r - 20
+
+        # Dark background circle
+        cv2.circle(img, (cx, cy), outer_r + 6, (15, 15, 15), -1, cv2.LINE_AA)
+        # Outer rim
+        cv2.circle(img, (cx, cy), outer_r, (180, 180, 180), 3, cv2.LINE_AA)
+        # Inner hub
+        cv2.circle(img, (cx, cy), 8, (200, 200, 200), -1, cv2.LINE_AA)
+
+        spoke_r = int(outer_r * 0.72)
+        sa = math.sin(steer_rad)
+        ca = math.cos(steer_rad)
+
+        # Main spoke (rotates with steering angle)
+        tip = (cx + int(sa * spoke_r), cy - int(ca * spoke_r))
+        cv2.line(img, (cx, cy), tip, (0, 220, 255), 4, cv2.LINE_AA)
+
+        # Cross spoke (perpendicular)
+        cross_r = int(spoke_r * 0.65)
+        cv2.line(img,
+                 (cx - int(ca * cross_r), cy - int(sa * cross_r)),
+                 (cx + int(ca * cross_r), cy + int(sa * cross_r)),
+                 (140, 140, 140), 2, cv2.LINE_AA)
+
+        # Angle label below the wheel
+        deg = math.degrees(steer_rad)
+        label = f"{deg:+.0f}\u00b0"
+        (tw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+        cv2.putText(img, label,
+                    (cx - tw // 2, cy + outer_r + 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
 
     def _reset_ui(self):
         self.btn_run.configure(state="normal")
